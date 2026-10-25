@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+# Non-intrusive Git post-commit hook to overcome the Probabilistic Caller Paradox.
+# Installs into .git/hooks/post-commit to ensure SSOT promotion even in long 20+ turn sessions.
+
+if command -v dual-ssot >/dev/null 2>&1; then
+    dual-ssot --workspace "$(git rev-parse --show-toplevel)" post-commit-hook
+fi
