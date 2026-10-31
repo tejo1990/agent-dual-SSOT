@@ -196,6 +196,10 @@ def atomic_tx(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     try:
         yield conn
         conn.execute("COMMIT;")
+        try:
+            conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+        except sqlite3.Error:
+            pass
     except Exception:
         if conn.in_transaction:
             conn.execute("ROLLBACK;")

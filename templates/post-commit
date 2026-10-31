@@ -2,6 +2,11 @@
 # Non-intrusive Git post-commit hook to overcome the Probabilistic Caller Paradox.
 # Installs into .git/hooks/post-commit to ensure SSOT promotion even in long 20+ turn sessions.
 
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+FALLBACK_BIN="c:/Project/antigravity/agent-dual-SSOT/.venv/Scripts/dual-ssot.exe"
+
 if command -v dual-ssot >/dev/null 2>&1; then
-    dual-ssot --workspace "$(git rev-parse --show-toplevel)" post-commit-hook
+    dual-ssot --workspace "$REPO_ROOT" post-commit-hook
+elif [ -x "$FALLBACK_BIN" ]; then
+    "$FALLBACK_BIN" --workspace "$REPO_ROOT" post-commit-hook
 fi

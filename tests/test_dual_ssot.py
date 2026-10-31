@@ -701,3 +701,40 @@ def test_cli_and_git_hook_bridge(tmp_path: Path) -> None:
     )
     assert (personal / "PERSONAL_CONTEXT_PACK.md").exists()
 
+
+
+def test_mcp_multi_workspace_dynamic_routing(tmp_path: Path) -> None:
+    """전역 MCP 서버 1개에서 여러 프로젝트 워크스페이스(.ssot/)로 세션별 동적 라우팅 검증."""
+    from dual_ssot.mcp_server import create_mcp_server
+
+    ws_a = tmp_path / "project_alpha"
+    ws_b = tmp_path / "project_beta"
+    personal = tmp_path / "global_personal"
+
+    mcp, _ = create_mcp_server(workspace_path=ws_a, personal_dir=personal)
+    # Extract registered tool functions
+    tools = {t.name: t.fn for t in mcp._tool_manager.list_tools()}
+
+    snap_a = tools["init_session"](session_id="sess_alpha", workspace_path=str(ws_a))
+    snap_b = tools["init_session"](session_id="sess_beta", workspace_path=str(ws_b))
+
+    assert snap_a["project_id"] == "project_alpha"
+    assert snap_b["project_id"] == "project_beta"
+
+    # Subsequent calls for sess_beta automatically route to ws_b without repeating workspace_path
+    tools["stage_decision"](
+        session_id="sess_beta",
+        topic_key="db.engine",
+        decision_value="DuckDB OLAP",
+        rationale="Embedded analytical queries",
+        evidence_ids=["file:src/analytics.py#L1-L20"],
+        file_scope=["src/analytics.py"],
+    )
+    promo_b = tools["promote_session"](
+        session_id="sess_beta",
+        proof={"file_exists": True, "git_diff_changed_lines": 12, "test_exit_code": 0},
+    )
+    assert promo_b["status"] == "PROMOTED"
+    assert (ws_b / ".ssot" / "ACTIVE_CONTEXT.md").exists()
+    assert "DuckDB OLAP" in (ws_b / ".ssot" / "ACTIVE_CONTEXT.md").read_text(encoding="utf-8")
+    assert "DuckDB OLAP" not in (ws_a / ".ssot" / "ACTIVE_CONTEXT.md").read_text(encoding="utf-8")
