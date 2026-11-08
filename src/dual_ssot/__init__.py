@@ -1,5 +1,10 @@
 """Dual-Scope & Session-Isolated Context Compiler MCP Package."""
 
+from dual_ssot.compiler import (
+    compute_pf_ib_lagrangian_breakdown,
+    compute_pf_ib_lagrangian_score,
+    enforce_l1_capacity_and_render,
+)
 from dual_ssot.engine import DualSSOTEngine
 from dual_ssot.mcp_server import create_mcp_server, estimate_mcp_tool_schema_tokens
 from dual_ssot.metrics import (

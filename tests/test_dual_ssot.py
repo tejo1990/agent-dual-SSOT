@@ -2,8 +2,37 @@
 
 from __future__ import annotations
 
+import contextlib
+import datetime
+import inspect
+import re
+import sqlite3
+import sys
+import tempfile
 from pathlib import Path
-import pytest
+from typing import Iterator, Optional, Type
+
+try:
+    import pytest  # type: ignore[import-not-found]
+except ImportError:
+    class _FallbackPytest:
+        @staticmethod
+        @contextlib.contextmanager
+        def raises(
+            exc_type: Type[BaseException], match: Optional[str] = None
+        ) -> Iterator[None]:
+            try:
+                yield
+            except exc_type as exc:
+                if match and not re.search(match, str(exc)):
+                    raise AssertionError(
+                        f"Exception {exc!r} did not match pattern {match!r}"
+                    ) from exc
+                return
+            raise AssertionError(f"Did not raise {exc_type.__name__}")
+
+    pytest = _FallbackPytest()  # type: ignore[assignment]
+
 from pydantic import ValidationError
 
 from dual_ssot import (
@@ -15,8 +44,11 @@ from dual_ssot import (
     ProofOfExecution,
     SimulationScenario,
     STARLPayload,
-     compute_min_promotion_projects,
+    compute_min_promotion_projects,
+    compute_pf_ib_lagrangian_breakdown,
+    compute_pf_ib_lagrangian_score,
     create_mcp_server,
+    enforce_l1_capacity_and_render,
     estimate_mcp_tool_schema_tokens,
     evaluate_conflict_detector_roi,
     evaluate_context_token_roi,
@@ -154,7 +186,10 @@ def test_scenario_1_stale_base_revision_conflict_when_session_a_promotes_first(
 
     cold = engine.query_cold_ledger("arch.execution_mode")
     assert any("하드웨어 유지" in n["rejected_hypothesis"] for n in cold["negative_knowledge"])
-    assert any(h["old_value"] == "하드웨어 유지" and h["new_value"] == "순수 SW 피벗" for h in cold["superseded_adr_history"])
+    assert any(
+        h["old_value"] == "하드웨어 유지" and h["new_value"] == "순수 SW 피벗"
+        for h in cold["superseded_adr_history"]
+    )
 
 
 def test_scenario_1_strategy_3c_dynamic_key_broadcast_and_leaf_scope_conflict(
@@ -294,6 +329,86 @@ def test_scenario_2_l1_upsert_and_hard_cap_compaction(tmp_path: Path) -> None:
     assert len(cold_query["demoted_l2_rules"]) == 1
 
 
+def test_scenario_2b_shy_pf_ib_5_variable_lagrangian_eviction(tmp_path: Path) -> None:
+    """
+    SHY × PF-IB 5변수 라그랑주 점수(J_PF_IB) 기반 L2_COLD 자동 강등 검증:
+    단순 step_order 오름차순(FIFO/LRU)이었다면 step_order=1(10일 경과)인 구형 규칙이 먼저 강등되었겠지만,
+    SHY × PF-IB 체제에서는 (1) 높은 개정 횟수(v10)와 범용 아키텍처 프리픽스(arch.*), (2) 짧은 토큰 비용을 가진
+    구형 핵심 규칙(arch.execution_mode)은 L1_HOT에 생존하고, 오히려 최근(step_order=2, 2일 경과)에 들어왔으나
+    일회성 도메인(competition.*)이면서 프롬프트 토큰을 과다 점유하는 규칙(competition.bloated_benchmark)이
+    J_PF_IB 최하위로 판정되어 L2_COLD로 먼저 강등되는지 검증.
+    """
+    ws = tmp_path / "proj_pf_ib"
+    engine = DualSSOTEngine(
+        workspace_path=ws,
+        personal_dir=tmp_path / "personal_pf_ib",
+        max_active_lines=6,
+        max_active_tokens=1500,
+    )
+    engine.init_session("sess_pf_ib")
+    engine.stage_decision(
+        session_id="sess_pf_ib",
+        topic_key="arch.execution_mode",
+        decision_value="Pure-Python stdlib deterministic verifier",
+        rationale="Zero external dependency runtime",
+        evidence_ids=["commit:arch001"],
+        pinned=False,
+    )
+    engine.stage_decision(
+        session_id="sess_pf_ib",
+        topic_key="competition.bloated_benchmark",
+        decision_value="One-off competition prompt tuning note: " + ("verbose_payload " * 60),
+        rationale="Temporary contest parameter sweep " + ("extra_detail " * 15),
+        evidence_ids=["commit:comp002"],
+        pinned=False,
+    )
+    engine.promote_session("sess_pf_ib")
+
+    conn = sqlite3.connect(str(ws / ".ssot" / "domain_ssot.db"))
+    conn.row_factory = sqlite3.Row
+    conn.execute(
+        "UPDATE base_decisions SET tier='L1_HOT', version=10, step_order=1, updated_at='2026-10-29T00:00:00+00:00' WHERE topic_key='arch.execution_mode'"
+    )
+    conn.execute(
+        "UPDATE base_decisions SET tier='L1_HOT', version=1, step_order=2, updated_at='2026-11-06T00:00:00+00:00' WHERE topic_key='competition.bloated_benchmark'"
+    )
+    conn.commit()
+
+    ref_now = datetime.datetime(2026, 11, 8, 12, 0, 0, tzinfo=datetime.timezone.utc)
+    row_arch = conn.execute(
+        "SELECT * FROM base_decisions WHERE topic_key='arch.execution_mode'"
+    ).fetchone()
+    row_comp = conn.execute(
+        "SELECT * FROM base_decisions WHERE topic_key='competition.bloated_benchmark'"
+    ).fetchone()
+
+    bd_arch = compute_pf_ib_lagrangian_breakdown(row_arch, max_step_order=2, now_utc=ref_now)
+    bd_comp = compute_pf_ib_lagrangian_breakdown(row_comp, max_step_order=2, now_utc=ref_now)
+
+    assert bd_arch["days_elapsed"] > bd_comp["days_elapsed"]
+    assert bd_arch["future_reuse_prob"] > bd_comp["future_reuse_prob"]
+    assert bd_arch["past_encoding_tokens"] < bd_comp["past_encoding_tokens"]
+    assert bd_arch["j_pf_ib"] > bd_comp["j_pf_ib"]
+
+    rendered_md, demoted_cnt = enforce_l1_capacity_and_render(
+        conn, max_lines=10, max_tokens=150, now_utc=ref_now
+    )
+    conn.commit()
+
+    assert demoted_cnt == 1
+    assert "**arch.execution_mode**" in rendered_md
+    assert "[COLD_INDEX]" in rendered_md and "competition.bloated_benchmark" in rendered_md
+    tier_arch = conn.execute(
+        "SELECT tier FROM base_decisions WHERE topic_key='arch.execution_mode'"
+    ).fetchone()[0]
+    tier_comp = conn.execute(
+        "SELECT tier FROM base_decisions WHERE topic_key='competition.bloated_benchmark'"
+    ).fetchone()[0]
+    conn.close()
+    assert tier_arch == "L1_HOT"
+    assert tier_comp == "L2_COLD"
+
+
 # ============================================================================
 # Scenario 3: Dual-Scope Isolation, Proof-of-Execution & Personal SSOT Gate
 # ============================================================================
@@ -416,7 +531,7 @@ def test_scenario_3_dual_scope_isolation_and_personal_promotion_gate(tmp_path: P
     assert len(pack_after_p1["starl_achievements"]) == 1
     assert len(pack_after_p1["active_meta_preferences"]) == 0
     assert len(pack_after_p1["candidate_meta_preferences"]) == 1
-    assert "TailwindCSS" not in pack_after_p1["markdown"]  # 도메인 전용 규칙은 Personal에 절대 섞이지 않음
+    assert "TailwindCSS" not in pack_after_p1["markdown"]
 
     # 5) 두 번째 프로젝트(robotics_project)에서 동일한 전역 코딩 습관이 다시 확인되면 ACTIVE로 자동 승격!
     engine_proj2 = DualSSOTEngine(
@@ -623,7 +738,6 @@ def test_adversarial_edge_cases_killswitch_resolutions_and_physical_poe(tmp_path
     assert conf_b.status == "CONFLICT_DETECTED"
     res_opt2 = engine.resolve_conflict(conf_b.conflicts[0].conflict_id, choice=2)
     assert res_opt2.status == "RESOLVED_BRAINSTORM"
-    # Base SSOT는 여전히 'SQLite WAL Store' 유지
     assert (
         engine.init_session("probe")["active_rules"]["arch.state_store"]["decision_value"]
         == "SQLite WAL Store"
@@ -702,7 +816,6 @@ def test_cli_and_git_hook_bridge(tmp_path: Path) -> None:
     assert (personal / "PERSONAL_CONTEXT_PACK.md").exists()
 
 
-
 def test_mcp_multi_workspace_dynamic_routing(tmp_path: Path) -> None:
     """전역 MCP 서버 1개에서 여러 프로젝트 워크스페이스(.ssot/)로 세션별 동적 라우팅 검증."""
     from dual_ssot.mcp_server import create_mcp_server
@@ -738,3 +851,21 @@ def test_mcp_multi_workspace_dynamic_routing(tmp_path: Path) -> None:
     assert (ws_b / ".ssot" / "ACTIVE_CONTEXT.md").exists()
     assert "DuckDB OLAP" in (ws_b / ".ssot" / "ACTIVE_CONTEXT.md").read_text(encoding="utf-8")
     assert "DuckDB OLAP" not in (ws_a / ".ssot" / "ACTIVE_CONTEXT.md").read_text(encoding="utf-8")
+
+
+if __name__ == "__main__":
+    current_mod = sys.modules[__name__]
+    test_funcs = [
+        (name, obj)
+        for name, obj in inspect.getmembers(current_mod, inspect.isfunction)
+        if name.startswith("test_")
+    ]
+    passed = 0
+    for name, fn in test_funcs:
+        sig = inspect.signature(fn)
+        with tempfile.TemporaryDirectory() as td:
+            kwargs = {"tmp_path": Path(td)} if "tmp_path" in sig.parameters else {}
+            fn(**kwargs)
+            print(f"[PASS] {name}")
+            passed += 1
+    print(f"\nAll {passed}/{len(test_funcs)} tests in test_dual_ssot.py passed!")
